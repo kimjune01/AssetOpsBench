@@ -286,13 +286,9 @@ async def test_run_passes_stderr_callback():
 
 @pytest.mark.anyio
 async def test_run_stderr_enriches_process_error():
-    """ProcessError is re-raised with captured stderr lines."""
-
-    captured_stderr_cb = {}
+    """ProcessError is re-raised with captured stderr lines instead of placeholder."""
 
     async def fake_query(prompt, options):
-        captured_stderr_cb["fn"] = options.stderr
-        # Simulate stderr lines arriving before the process fails
         options.stderr("API Error: 400 context_management: Extra inputs")
         options.stderr("Received Model Group=aws/claude-opus-4-6")
         raise ProcessError("Command failed with exit code 1", exit_code=1, stderr="Check stderr output for details")
@@ -300,5 +296,9 @@ async def test_run_stderr_enriches_process_error():
 
     with patch("agent.claude_agent.runner.query", side_effect=fake_query):
         runner = ClaudeAgentRunner(server_paths={})
-        with pytest.raises(ProcessError, match="context_management"):
+        with pytest.raises(ProcessError) as exc_info:
             await runner.run("trigger error")
+
+    assert exc_info.value.exit_code == 1
+    assert "context_management" in exc_info.value.stderr
+    assert "Check stderr output for details" not in exc_info.value.stderr

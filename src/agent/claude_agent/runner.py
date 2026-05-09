@@ -118,10 +118,13 @@ class ClaudeAgentRunner(AgentRunner):
         ) as span:
             stderr_lines: list[str] = []
 
-            def _on_stderr(line: str) -> None:
+            def _on_stderr(chunk: str) -> None:
                 """Capture and log subprocess stderr so errors are not swallowed."""
-                stderr_lines.append(line)
-                _log.warning("claude-agent stderr: %s", line)
+                for line in chunk.splitlines() or [chunk]:
+                    line = line.rstrip()
+                    if line:
+                        stderr_lines.append(line)
+                        _log.warning("claude-agent stderr: %s", line)
 
             options = ClaudeAgentOptions(
                 model=self._model,
