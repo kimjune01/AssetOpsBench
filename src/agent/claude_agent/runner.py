@@ -210,9 +210,12 @@ class ClaudeAgentRunner(AgentRunner):
             except ProcessError as exc:
                 # Re-raise with actual captured stderr instead of the
                 # generic "Check stderr output for details" placeholder.
+                # Avoid passing str(exc) as the message — ProcessError.__init__
+                # appends exit_code and stderr to the message, so str(exc)
+                # already contains those suffixes and they would be doubled.
                 if stderr_lines:
                     raise ProcessError(
-                        str(exc),
+                        "claude-agent subprocess failed",
                         exit_code=exc.exit_code,
                         stderr="\n".join(stderr_lines),
                     ) from exc
