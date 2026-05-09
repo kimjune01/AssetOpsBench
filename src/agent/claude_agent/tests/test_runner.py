@@ -12,6 +12,7 @@ import pytest
 
 from agent.claude_agent.runner import ClaudeAgentRunner, _build_mcp_servers, _sdk_env
 from agent.models import AgentResult, Trajectory
+from claude_agent_sdk._errors import ProcessError
 
 
 def test_resolve_model_stored_on_runner():
@@ -253,3 +254,51 @@ async def test_run_empty_result():
     assert result.answer == ""
     assert isinstance(result.trajectory, Trajectory)
     assert result.trajectory.turns == []
+
+
+# ---------------------------------------------------------------------------
+# stderr surfacing (#275)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_run_passes_stderr_callback():
+    """ClaudeAgentOptions.stderr receives a callable, not a file object."""
+    from claude_agent_sdk import ResultMessage
+
+    mock_result = MagicMock(spec=ResultMessage)
+    mock_result.result = "ok"
+    mock_result.stop_reason = "end_turn"
+
+    captured_options = {}
+
+    async def fake_query(prompt, options):
+        captured_options["stderr"] = options.stderr
+        yield mock_result
+
+    with patch("agent.claude_agent.runner.query", side_effect=fake_query):
+        runner = ClaudeAgentRunner(server_paths={})
+        await runner.run("test")
+
+    # The stderr field must be a callable (not sys.stderr or None)
+    assert callable(captured_options["stderr"])
+
+
+@pytest.mark.anyio
+async def test_run_stderr_enriches_process_error():
+    """ProcessError is re-raised with captured stderr lines."""
+
+    captured_stderr_cb = {}
+
+    async def fake_query(prompt, options):
+        captured_stderr_cb["fn"] = options.stderr
+        # Simulate stderr lines arriving before the process fails
+        options.stderr("API Error: 400 context_management: Extra inputs")
+        options.stderr("Received Model Group=aws/claude-opus-4-6")
+        raise ProcessError("Command failed with exit code 1", exit_code=1, stderr="Check stderr output for details")
+        yield  # noqa: B901 — unreachable, makes this an async generator
+
+    with patch("agent.claude_agent.runner.query", side_effect=fake_query):
+        runner = ClaudeAgentRunner(server_paths={})
+        with pytest.raises(ProcessError, match="context_management"):
+            await runner.run("trigger error")

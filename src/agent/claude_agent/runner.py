@@ -23,6 +23,7 @@ from pathlib import Path
 
 from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, HookMatcher, ResultMessage, query
 from claude_agent_sdk import TextBlock, ToolUseBlock
+from claude_agent_sdk._errors import ProcessError
 
 from observability import agent_run_span, persist_trajectory
 
@@ -115,6 +116,13 @@ class ClaudeAgentRunner(AgentRunner):
         with agent_run_span(
             "claude-agent", model=self._model, question=question
         ) as span:
+            stderr_lines: list[str] = []
+
+            def _on_stderr(line: str) -> None:
+                """Capture and log subprocess stderr so errors are not swallowed."""
+                stderr_lines.append(line)
+                _log.warning("claude-agent stderr: %s", line)
+
             options = ClaudeAgentOptions(
                 model=self._model,
                 system_prompt=AGENT_SYSTEM_PROMPT,
@@ -122,6 +130,7 @@ class ClaudeAgentRunner(AgentRunner):
                 max_turns=self._max_turns,
                 permission_mode=self._permission_mode,
                 env=self._sdk_env,
+                stderr=_on_stderr,
             )
 
             _log.info("ClaudeAgentRunner: starting query (model=%s)", self._model)
@@ -156,44 +165,55 @@ class ClaudeAgentRunner(AgentRunner):
                     if tc.id in tool_outputs:
                         tc.output = tool_outputs.pop(tc.id)
 
-            async for message in query(prompt=question, options=options):
-                if isinstance(message, AssistantMessage):
-                    _flush_tool_outputs()
-                    now = time.perf_counter()
-                    turn_duration_ms = (now - last_turn_start) * 1000
-                    last_turn_start = now
-                    text = ""
-                    tool_calls: list[ToolCall] = []
-                    for block in message.content:
-                        if isinstance(block, TextBlock):
-                            text += block.text
-                        elif isinstance(block, ToolUseBlock):
-                            tool_calls.append(
-                                ToolCall(name=block.name, input=block.input, id=block.id)
+            try:
+                async for message in query(prompt=question, options=options):
+                    if isinstance(message, AssistantMessage):
+                        _flush_tool_outputs()
+                        now = time.perf_counter()
+                        turn_duration_ms = (now - last_turn_start) * 1000
+                        last_turn_start = now
+                        text = ""
+                        tool_calls: list[ToolCall] = []
+                        for block in message.content:
+                            if isinstance(block, TextBlock):
+                                text += block.text
+                            elif isinstance(block, ToolUseBlock):
+                                tool_calls.append(
+                                    ToolCall(name=block.name, input=block.input, id=block.id)
+                                )
+                        usage = message.usage or {}
+                        trajectory.turns.append(
+                            TurnRecord(
+                                index=turn_index,
+                                text=text,
+                                tool_calls=tool_calls,
+                                input_tokens=usage.get("input_tokens", 0),
+                                output_tokens=usage.get("output_tokens", 0),
+                                duration_ms=turn_duration_ms,
                             )
-                    usage = message.usage or {}
-                    trajectory.turns.append(
-                        TurnRecord(
-                            index=turn_index,
-                            text=text,
-                            tool_calls=tool_calls,
-                            input_tokens=usage.get("input_tokens", 0),
-                            output_tokens=usage.get("output_tokens", 0),
-                            duration_ms=turn_duration_ms,
                         )
-                    )
-                    turn_index += 1
-                elif isinstance(message, ResultMessage):
-                    _flush_tool_outputs()
-                    answer = message.result or ""
-                    _log.info(
-                        "ClaudeAgentRunner: done (stop_reason=%s, turns=%d, "
-                        "input_tokens=%d, output_tokens=%d)",
-                        message.stop_reason,
-                        len(trajectory.turns),
-                        trajectory.total_input_tokens,
-                        trajectory.total_output_tokens,
-                    )
+                        turn_index += 1
+                    elif isinstance(message, ResultMessage):
+                        _flush_tool_outputs()
+                        answer = message.result or ""
+                        _log.info(
+                            "ClaudeAgentRunner: done (stop_reason=%s, turns=%d, "
+                            "input_tokens=%d, output_tokens=%d)",
+                            message.stop_reason,
+                            len(trajectory.turns),
+                            trajectory.total_input_tokens,
+                            trajectory.total_output_tokens,
+                        )
+            except ProcessError as exc:
+                # Re-raise with actual captured stderr instead of the
+                # generic "Check stderr output for details" placeholder.
+                if stderr_lines:
+                    raise ProcessError(
+                        str(exc),
+                        exit_code=exc.exit_code,
+                        stderr="\n".join(stderr_lines),
+                    ) from exc
+                raise
 
             duration_ms = (time.perf_counter() - run_started) * 1000
             span.set_attribute("agent.answer.length", len(answer))
